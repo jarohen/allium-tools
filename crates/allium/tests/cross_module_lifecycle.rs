@@ -651,6 +651,180 @@ fn t65_deadlock_when_ticket_analysed_alone() {
 }
 
 // ===========================================================================
+// #70 — split-invariance: a spec as one file produces the same reports as the
+// same spec split across a `use` edge. The transition-trigger start state must
+// be credited locally, not only across the module boundary. This is the #66
+// oracle I asserted in prose but never tested, which is how the regression got
+// in.
+// ===========================================================================
+
+const T70_SINGLE: &str = r#"-- allium: 3
+
+entity Ticket {
+    status: closed | archived
+    transitions status { closed -> archived  terminal: archived }
+}
+
+rule CreateTicket {
+    when: CreateTicketRequested()
+    ensures: Ticket.created(status: closed)
+}
+
+rule ArchiveClosedTicket {
+    when: t: Ticket.status becomes closed
+    ensures: t.status = archived
+}
+
+surface TicketDesk {
+    provides:
+        CreateTicketRequested()
+}
+"#;
+
+const T70_DOMAIN: &str = r#"-- allium: 3
+
+entity Ticket {
+    status: closed | archived
+    transitions status { closed -> archived  terminal: archived }
+}
+
+rule CreateTicket {
+    when: CreateTicketRequested()
+    ensures: Ticket.created(status: closed)
+}
+
+surface TicketDesk {
+    provides:
+        CreateTicketRequested()
+}
+"#;
+
+const T70_CONSOLE: &str = r#"-- allium: 3
+
+use "./ticket.allium" as tickets
+
+rule ArchiveClosedTicket {
+    when: t: tickets/Ticket.status becomes closed
+    ensures: t.status = archived
+}
+"#;
+
+/// A comparable report set (code + message for diagnostics, kind + summary for
+/// findings), independent of which file a report lands in.
+fn report_set(stdout: &str) -> Vec<String> {
+    let mut rows: Vec<String> = parse_diagnostics(stdout)
+        .into_iter()
+        .map(|d| format!("D {} {}", d.code, d.message))
+        .collect();
+    rows.extend(
+        parse_findings(stdout)
+            .into_iter()
+            .map(|f| format!("F {} {}", f.kind, f.summary)),
+    );
+    rows.sort();
+    rows
+}
+
+#[test]
+fn t70_single_file_matches_split_for_becomes_trigger() {
+    let single = TempDir::new("70-single");
+    single.write("ticket.allium", T70_SINGLE);
+    let split = TempDir::new("70-split");
+    split.write("ticket.allium", T70_DOMAIN);
+    split.write("operator-console.allium", T70_CONSOLE);
+
+    for cmd in ["check", "analyse"] {
+        let (_o1, single_out) = run(cmd, &[&single.file("ticket.allium")]);
+        let (_o2, split_out) = run(cmd, &[split.path().to_str().unwrap()]);
+        assert_eq!(
+            report_set(&single_out),
+            report_set(&split_out),
+            "{cmd}: the one-file spec and its split must produce the same reports.\nsingle: {:?}\nsplit: {:?}",
+            report_set(&single_out),
+            report_set(&split_out)
+        );
+    }
+}
+
+// A generator-driven version of the split-invariance oracle, so it covers the
+// matrix (both trigger forms, varied entity/state names) rather than one cell.
+// Seeded SplitMix64, pure std. The CLI is spawned per case, so the seed count is
+// modest.
+
+struct Rng(u64);
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1))
+    }
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+}
+
+/// One logical spec in two shapes: as a single file, and split into a domain
+/// module plus a console module that owns the transition-trigger rule and
+/// refers to the entity by qualified name.
+fn gen_single_and_split(seed: u64) -> (String, String, String) {
+    let mut r = Rng::new(seed);
+    let name = format!("E{}", r.below(10000));
+    let s0 = format!("a{}", r.below(1000));
+    let s1 = format!("b{}", r.below(1000));
+    let trig = if r.below(2) == 0 { "becomes" } else { "transitions_to" };
+
+    let entity = format!(
+        "entity {name} {{\n    status: {s0} | {s1}\n    transitions status {{ {s0} -> {s1}  terminal: {s1} }}\n}}\n"
+    );
+    let create = format!(
+        "rule Create{name} {{\n    when: Create{name}Requested()\n    ensures: {name}.created(status: {s0})\n}}\n"
+    );
+    let surface = format!(
+        "surface {name}Desk {{\n    provides:\n        Create{name}Requested()\n}}\n"
+    );
+    let advance_local = format!(
+        "rule Advance{name} {{\n    when: t: {name}.status {trig} {s0}\n    ensures: t.status = {s1}\n}}\n"
+    );
+    let advance_qualified = format!(
+        "rule Advance{name} {{\n    when: t: dom/{name}.status {trig} {s0}\n    ensures: t.status = {s1}\n}}\n"
+    );
+
+    let single = format!("-- allium: 3\n\n{entity}\n{create}\n{advance_local}\n{surface}");
+    let domain = format!("-- allium: 3\n\n{entity}\n{create}\n{surface}");
+    let console = format!("-- allium: 3\n\nuse \"./domain.allium\" as dom\n\n{advance_qualified}");
+    (single, domain, console)
+}
+
+#[test]
+fn prop_single_file_matches_split_for_transition_trigger() {
+    for seed in 0..16u64 {
+        let (single_src, domain_src, console_src) = gen_single_and_split(seed);
+        let sdir = TempDir::new(&format!("splitinv-s{seed}"));
+        sdir.write("spec.allium", &single_src);
+        let pdir = TempDir::new(&format!("splitinv-p{seed}"));
+        pdir.write("domain.allium", &domain_src);
+        pdir.write("console.allium", &console_src);
+
+        for cmd in ["check", "analyse"] {
+            let (_a, single_out) = run(cmd, &[&sdir.file("spec.allium")]);
+            let (_b, split_out) = run(cmd, &[pdir.path().to_str().unwrap()]);
+            assert_eq!(
+                report_set(&single_out),
+                report_set(&split_out),
+                "seed {seed} {cmd}: one-file spec and its split diverge.\nSINGLE:\n{single_src}\n-> {:?}\n\nSPLIT domain:\n{domain_src}\nconsole:\n{console_src}\n-> {:?}",
+                report_set(&single_out),
+                report_set(&split_out)
+            );
+        }
+    }
+}
+
+// ===========================================================================
 // Gate: crediting requires a real import edge, not arbitrary co-supply
 // ===========================================================================
 
