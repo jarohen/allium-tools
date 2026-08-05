@@ -208,6 +208,218 @@ fn prop_redundant_trigger_guard_is_invariant() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Branch-nesting invariance for undefined-binding detection.
+//
+// A reference to an unbound name must be flagged the same whether it sits at the
+// top level of a rule or inside an `if`/`else` body. The undefined-binding pass
+// used to walk only the top level (plus one level of `for`), so a branch-nested
+// reference went silently unflagged.
+// ---------------------------------------------------------------------------
+
+fn undefined_binding_codes(src: &str) -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = diagnostics_of(src)
+        .iter()
+        .filter_map(|d| d.code)
+        .filter(|c| *c == "allium.rule.undefinedBinding")
+        .collect();
+    v.sort_unstable();
+    v
+}
+
+// ---------------------------------------------------------------------------
+// Branch-nesting invariance (generative). Wrapping a rule's `requires`/`ensures`
+// in an identical `if flag: ... else: ...` is semantically a no-op, so the set of
+// reports must be unchanged — across every analysis pass. A pass that still walks
+// only the top level of a rule body breaks this. A fault (an undefined binding, an
+// undeclared type) is injected on some seeds so the property also asserts a
+// diagnostic is raised whether its clause is flat or nested.
+//
+// Wrapping duplicates the clause, so a per-clause diagnostic fires twice in the
+// wrapped form; the invariant is therefore set-equality of report *kinds* (a
+// branch gap makes a report vanish, which this still catches) rather than a
+// multiset.
+// ---------------------------------------------------------------------------
+
+/// Wrap a clause block in `depth` levels of identical `if flag: … else: …`. Both
+/// branches are the same, so it is a semantic no-op at any depth. A pass that
+/// descends only one level of nesting would miss a clause wrapped deeper.
+fn wrap_ifelse(inner: &str, depth: u32) -> String {
+    if depth == 0 {
+        return inner.to_string();
+    }
+    let deeper = wrap_ifelse(inner, depth - 1);
+    format!("if flag:\n{deeper}\nelse:\n{deeper}\n")
+}
+
+fn gen_branch_case(rng: &mut Rng, depth: u32) -> String {
+    let name = format!("Ent{}", rng.below(1000));
+    let s0 = format!("s{}start", rng.below(100));
+    let s1 = format!("s{}end", rng.below(100));
+    let (req, ens) = match rng.below(3) {
+        1 => (
+            format!("requires: ghost.status = {s0}"),
+            format!("ensures: t.status = {s1}"),
+        ),
+        2 => (
+            format!("requires: t.status = {s0}"),
+            format!("ensures: Ghost{name}.created(status: {s0})"),
+        ),
+        _ => (
+            format!("requires: t.status = {s0}"),
+            format!("ensures: t.status = {s1}"),
+        ),
+    };
+    let body = wrap_ifelse(&format!("{req}\n{ens}"), depth);
+    format!(
+        "-- allium: 3\n\
+         entity {name} {{\n    status: {s0} | {s1}\n    transitions status {{ {s0} -> {s1}  terminal: {s1} }}\n}}\n\
+         rule Create{name} {{\n    when: Create{name}Requested()\n    ensures: {name}.created(status: {s0})\n}}\n\
+         rule Advance{name} {{\n    when: Advance{name}(t, flag)\n{body}\n}}\n\
+         surface {name}Desk {{\n    provides:\n        Create{name}Requested()\n        Advance{name}(t: {name}, flag)\n}}\n",
+    )
+}
+
+fn report_kinds(src: &str) -> Vec<String> {
+    let mut v = report_set(src);
+    v.dedup();
+    v
+}
+
+#[test]
+fn branch_wrapping_is_report_invariant() {
+    for seed in 0..400u64 {
+        // Compare the flat form against 1..=3 levels of identical if/else nesting;
+        // the depth cycles with the seed so every depth is exercised.
+        let depth = 1 + (seed % 3) as u32;
+        let flat = gen_branch_case(&mut Rng::new(seed), 0);
+        let nested = gen_branch_case(&mut Rng::new(seed), depth);
+        let a = report_kinds(&flat);
+        let b = report_kinds(&nested);
+        assert_eq!(
+            a, b,
+            "seed {seed}: wrapping requires/ensures in {depth} level(s) of identical if/else changed the reports.\n\
+             FLAT:\n{flat}\n-> {a:?}\n\nNESTED:\n{nested}\n-> {b:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Declaration-order invariance. Reordering a spec's top-level declarations must
+// not change the reports: the analysis is a function of the spec, not its text
+// order. This targets order-dependent bugs — HashMap iteration order, or a
+// first-writer-wins aggregation across entities — that the split-invariance
+// properties never disturb. Some entities are generated without an advancing
+// rule so they produce lifecycle findings, making the invariant non-trivial.
+// ---------------------------------------------------------------------------
+
+fn gen_blocks(rng: &mut Rng) -> Vec<String> {
+    let n = 3 + rng.below(4); // 3..=6 entities
+    let mut blocks = Vec::new();
+    for i in 0..n {
+        let name = format!("Ent{i}");
+        let s0 = format!("s{i}a");
+        let s1 = format!("s{i}b");
+        blocks.push(format!(
+            "entity {name} {{\n    status: {s0} | {s1}\n    transitions status {{ {s0} -> {s1}  terminal: {s1} }}\n}}\n"
+        ));
+        blocks.push(format!(
+            "rule Create{name} {{\n    when: {name}Req()\n    ensures: {name}.created(status: {s0})\n}}\n"
+        ));
+        // Omit the advancing rule on some entities, so they draw lifecycle
+        // findings and the report set is non-empty.
+        if rng.below(2) == 0 {
+            blocks.push(format!(
+                "rule Advance{name} {{\n    when: b: {name}.status becomes {s0}\n    ensures: b.status = {s1}\n}}\n"
+            ));
+        }
+        blocks.push(format!(
+            "surface {name}Desk {{\n    provides:\n        {name}Req()\n}}\n"
+        ));
+    }
+    blocks
+}
+
+fn shuffle(rng: &mut Rng, v: &mut [String]) {
+    for i in (1..v.len()).rev() {
+        let j = rng.below(i + 1);
+        v.swap(i, j);
+    }
+}
+
+#[test]
+fn declaration_order_is_report_invariant() {
+    for seed in 0..250u64 {
+        let mut rng = Rng::new(seed);
+        let blocks = gen_blocks(&mut rng);
+        let base = format!("-- allium: 3\n\n{}", blocks.join("\n"));
+        let mut shuffled = blocks.clone();
+        shuffle(&mut rng, &mut shuffled);
+        let variant = format!("-- allium: 3\n\n{}", shuffled.join("\n"));
+        let a = report_set(&base);
+        let b = report_set(&variant);
+        assert_eq!(
+            a, b,
+            "seed {seed}: reordering top-level declarations changed the reports.\n\
+             BASE -> {a:?}\nSHUFFLED -> {b:?}\n\n{variant}"
+        );
+    }
+}
+
+#[test]
+fn undefined_binding_flagged_inside_if_branch() {
+    let base = "-- allium: 3\n\nentity Job {\n    status: pending | done\n    transitions status { pending -> done  terminal: done }\n}\n\nsurface S {\n    provides:\n        Go(flag)\n}\n";
+    let top = format!(
+        "{base}\nrule R {{\n    when: Go(flag)\n    requires: ghost.status = pending\n    ensures: Job.created(status: pending)\n}}\n"
+    );
+    let branched = format!(
+        "{base}\nrule R {{\n    when: Go(flag)\n    if flag:\n        requires: ghost.status = pending\n        ensures: Job.created(status: pending)\n    else:\n        ensures: Job.created(status: pending)\n}}\n"
+    );
+    let t = undefined_binding_codes(&top);
+    let b = undefined_binding_codes(&branched);
+    assert!(!t.is_empty(), "control: a top-level undefined binding should be flagged, got {t:?}");
+    assert_eq!(
+        t, b,
+        "an undefined binding nested in an if-branch was not flagged like the top-level form"
+    );
+}
+
+#[test]
+fn branch_local_let_is_not_a_false_positive() {
+    // A `let` declared inside a branch scopes that branch, so referencing it
+    // there must not trip undefinedBinding.
+    let src = "-- allium: 3\n\nentity Job {\n    status: pending | done\n    transitions status { pending -> done  terminal: done }\n}\n\nsurface S {\n    provides:\n        Go(flag)\n}\n\nrule R {\n    when: Go(flag)\n    if flag:\n        let j = Job\n        ensures: j.status = done\n    else:\n        ensures: Job.created(status: pending)\n}\n";
+    assert!(
+        undefined_binding_codes(src).is_empty(),
+        "a branch-local let was wrongly flagged as undefined: {:?}",
+        undefined_binding_codes(src)
+    );
+}
+
+#[test]
+fn undeclared_type_flagged_inside_if_branch() {
+    // A type reference to an undeclared entity must be flagged the same whether
+    // it sits at the top level of a rule or inside an `if`/`else` body. The
+    // type-reference pass used to walk only top-level clauses.
+    let base = "-- allium: 3\n\nentity Job {\n    status: pending | done\n    transitions status { pending -> done  terminal: done }\n}\n\nsurface S {\n    provides:\n        Go(flag)\n}\n";
+    let top = format!(
+        "{base}\nrule R {{\n    when: Go(flag)\n    ensures: Ghost.created(status: pending)\n}}\n"
+    );
+    let branched = format!(
+        "{base}\nrule R {{\n    when: Go(flag)\n    if flag:\n        ensures: Ghost.created(status: pending)\n    else:\n        ensures: Job.created(status: pending)\n}}\n"
+    );
+    let has_undeclared = |src: &str| {
+        diagnostics_of(src)
+            .iter()
+            .any(|d| d.message.contains("Type reference 'Ghost' is not declared"))
+    };
+    assert!(has_undeclared(&top), "control: a top-level undeclared type should be flagged");
+    assert!(
+        has_undeclared(&branched),
+        "an undeclared type nested in an if-branch was not flagged like the top-level form"
+    );
+}
+
 #[test]
 fn becomes_triggered_transition_has_no_false_noexit() {
     // #70 subject, single file: the exit from `closed` is witnessed by the

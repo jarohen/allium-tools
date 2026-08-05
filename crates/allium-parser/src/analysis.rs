@@ -67,6 +67,11 @@ pub struct ReverseContributions {
     /// witnesses by guarding on `from` and assigning `to` on a binding typed to
     /// that entity by the imported module's surface `provides:` (#64).
     pub witnessed_transitions: HashMap<String, HashSet<(String, String)>>,
+    /// Field names of imported entities that an importer references via a
+    /// qualified access (`alias/Entity.field`). Such a field is used even though
+    /// its only reference lives in another module, so the imported module must
+    /// not report it as unused.
+    pub referenced_fields: HashSet<String>,
 }
 
 impl ReverseContributions {
@@ -75,6 +80,7 @@ impl ReverseContributions {
         self.provided_triggers.is_empty()
             && self.assigned_statuses.is_empty()
             && self.witnessed_transitions.is_empty()
+            && self.referenced_fields.is_empty()
     }
 
     /// Fold another importer's contributions into this aggregate.
@@ -86,6 +92,7 @@ impl ReverseContributions {
         for (entity, edges) in other.witnessed_transitions {
             self.witnessed_transitions.entry(entity).or_default().extend(edges);
         }
+        self.referenced_fields.extend(other.referenced_fields);
     }
 }
 
@@ -145,9 +152,8 @@ fn run_checks(mut ctx: Ctx<'_>, source: &str) -> Vec<Diagnostic> {
     ctx.check_duplicate_let_bindings();
     ctx.check_config_undefined_references();
     ctx.check_list_literal_homogeneity();
-    ctx.check_qualified_default_aliases();
+    ctx.check_undefined_import_aliases();
     ctx.check_default_field_schemas();
-    ctx.check_qualified_provides();
 
     let mut diagnostics = apply_suppressions(ctx.diagnostics, source);
     // Deterministic ordering: the analysis passes iterate `HashMap`s, whose
@@ -180,7 +186,7 @@ pub fn analyse_with_external_refs(
     external_refs: &HashSet<String>,
 ) -> crate::diagnostic::AnalyseResult {
     let diagnostics = analyze_with_external_refs(module, source, external_refs);
-    let findings = find_process_issues(module, None, None);
+    let findings = find_process_issues(module, None, None, None);
     crate::diagnostic::AnalyseResult {
         diagnostics,
         findings,
@@ -200,6 +206,7 @@ pub fn analyse_with_cross_module(
     ambiguous_imports: &AmbiguousImports,
     reverse: &ReverseContributions,
     imported_referenced_triggers: &HashMap<String, HashSet<String>>,
+    imported_entity_statuses: &HashMap<String, HashSet<String>>,
 ) -> crate::diagnostic::AnalyseResult {
     let diagnostics = analyze_with_cross_module(
         module,
@@ -212,7 +219,12 @@ pub fn analyse_with_cross_module(
         reverse,
         imported_referenced_triggers,
     );
-    let findings = find_process_issues(module, Some(imported_triggers), Some(reverse));
+    let findings = find_process_issues(
+        module,
+        Some(imported_triggers),
+        Some(reverse),
+        Some(imported_entity_statuses),
+    );
     crate::diagnostic::AnalyseResult {
         diagnostics,
         findings,
@@ -300,13 +312,15 @@ fn find_process_issues(
     module: &Module,
     imported_triggers: Option<&HashMap<String, HashSet<String>>>,
     reverse: Option<&ReverseContributions>,
+    imported_statuses: Option<&HashMap<String, HashSet<String>>>,
 ) -> Vec<crate::diagnostic::Finding> {
     let empty = HashSet::new();
+    let no_statuses = HashMap::new();
     let mut ctx = Ctx::new(module, &empty, None, imported_triggers, None);
     ctx.reverse_contributions = reverse;
     let info = EntityInfo::from_module(module);
     ctx.collect_process_findings(&info);
-    ctx.collect_conflict_findings(&info);
+    ctx.collect_conflict_findings(&info, imported_statuses.unwrap_or(&no_statuses));
     ctx.collect_invariant_findings(&info);
     let mut findings = std::mem::take(&mut ctx.findings);
     // Deterministic ordering (#71): findings carry no source span, so order by
@@ -1641,8 +1655,27 @@ impl Ctx<'_> {
         }
     }
 
-    fn collect_conflict_findings(&mut self, info: &EntityInfo<'_>) {
-        let status_by_entity = info.status_by_entity();
+    fn collect_conflict_findings(
+        &mut self,
+        info: &EntityInfo<'_>,
+        imported_statuses: &HashMap<String, HashSet<String>>,
+    ) {
+        // Conflict attribution resolves a rule's entity from the status values it
+        // reads and writes, so an importer rule acting on an imported entity needs
+        // that entity's status vocabulary in scope. Merge the imported statuses in
+        // for *this* pass only — the lifecycle checks stay local, so imported
+        // entities are not re-analysed in the importer. A local declaration wins on
+        // a name clash.
+        let local = info.status_by_entity();
+        let mut status_by_entity: HashMap<&str, HashSet<&str>> = HashMap::new();
+        for (k, v) in &local {
+            status_by_entity.insert(*k, v.iter().copied().collect());
+        }
+        for (ent, statuses) in imported_statuses {
+            status_by_entity
+                .entry(ent.as_str())
+                .or_insert_with(|| statuses.iter().map(String::as_str).collect());
+        }
 
         if status_by_entity.is_empty() {
             return;
@@ -1664,39 +1697,37 @@ impl Ctx<'_> {
             };
             // Conflict detection resolves entities by name matching against
             // status_by_entity, not through binding types from when clauses.
-            let binding_types = collect_rule_binding_types(rule, &HashMap::new());
+            let binding_types = collect_rule_binding_types(rule, &HashMap::<&str, ()>::new());
 
             let mut trigger_kind = ConflictTriggerKind::Unknown;
             let mut requires_statuses: HashMap<String, HashSet<String>> = HashMap::new();
             let mut ensures_statuses: HashMap<String, String> = HashMap::new();
 
-            for item in &rule.items {
-                let BlockItemKind::Clause { keyword, value } = &item.kind else {
-                    continue;
-                };
-                match keyword.as_str() {
-                    "when" => {
-                        trigger_kind = classify_trigger(value);
-                    }
-                    "requires" => {
-                        collect_requires_statuses_for_conflict(
-                            value,
-                            &binding_types,
-                            &status_by_entity,
-                            &mut requires_statuses,
-                        );
-                    }
-                    "ensures" => {
-                        collect_ensures_statuses_for_conflict(
-                            value,
-                            &binding_types,
-                            &status_by_entity,
-                            &mut ensures_statuses,
-                        );
-                    }
-                    _ => {}
+            // Descend into `if`/`else` and `for` bodies so a conditional effect
+            // nested in a branch still counts toward conflict detection; a
+            // top-level-only walk let a branch-nested `ensures` hide a conflict.
+            for_each_rule_clause(&rule.items, &mut |keyword, value| match keyword {
+                "when" => {
+                    trigger_kind = classify_trigger(value);
                 }
-            }
+                "requires" => {
+                    collect_requires_statuses_for_conflict(
+                        value,
+                        &binding_types,
+                        &status_by_entity,
+                        &mut requires_statuses,
+                    );
+                }
+                "ensures" => {
+                    collect_ensures_statuses_for_conflict(
+                        value,
+                        &binding_types,
+                        &status_by_entity,
+                        &mut ensures_statuses,
+                    );
+                }
+                _ => {}
+            });
 
             conflict_rules.push(ConflictRule {
                 name: rule_name,
@@ -1800,46 +1831,43 @@ impl Ctx<'_> {
             let mut field_sets = HashSet::new();
             let mut requires = Vec::new();
 
-            for item in &rule.items {
-                let BlockItemKind::Clause { keyword, value } = &item.kind else {
-                    continue;
-                };
-                match keyword.as_str() {
-                    "ensures" => {
-                        collect_rule_effects(
-                            value,
-                            &binding_types,
-                            &status_by_entity,
-                            &field_types,
-                            &mut status_sets,
-                            &mut field_sets,
-                        );
-                    }
-                    "requires" => {
-                        collect_requires_conditions(
-                            value,
-                            &binding_types,
-                            &binding_map,
-                            &mut |binding, field, val| {
-                                let entity = resolve_binding_entity(
-                                    binding,
-                                    None,
-                                    &binding_types,
-                                    &binding_map_for_types,
-                                );
-                                if let Some(e) = entity {
-                                    requires.push((
-                                        e.to_string(),
-                                        field.to_string(),
-                                        val.to_string(),
-                                    ));
-                                }
-                            },
-                        );
-                    }
-                    _ => {}
+            // Descend into `if`/`else` and `for` bodies so branch-nested effects
+            // and guards count toward the rule's effect set.
+            for_each_rule_clause(&rule.items, &mut |keyword, value| match keyword {
+                "ensures" => {
+                    collect_rule_effects(
+                        value,
+                        &binding_types,
+                        &status_by_entity,
+                        &field_types,
+                        &mut status_sets,
+                        &mut field_sets,
+                    );
                 }
-            }
+                "requires" => {
+                    collect_requires_conditions(
+                        value,
+                        &binding_types,
+                        &binding_map,
+                        &mut |binding, field, val| {
+                            let entity = resolve_binding_entity(
+                                binding,
+                                None,
+                                &binding_types,
+                                &binding_map_for_types,
+                            );
+                            if let Some(e) = entity {
+                                requires.push((
+                                    e.to_string(),
+                                    field.to_string(),
+                                    val.to_string(),
+                                ));
+                            }
+                        },
+                    );
+                }
+                _ => {}
+            });
 
             rule_effects.push(RuleEffect {
                 name: rule_name,
@@ -2589,9 +2617,9 @@ fn collect_created_field_assignments<'a>(
     }
 }
 
-fn collect_rule_binding_types<'a>(
+fn collect_rule_binding_types<'a, V>(
     rule: &'a BlockDecl,
-    status_by_entity: &HashMap<&str, (Vec<&Ident>, HashSet<&str>)>,
+    status_by_entity: &HashMap<&str, V>,
 ) -> HashMap<&'a str, &'a str> {
     let mut types = HashMap::new();
     for item in &rule.items {
@@ -2606,9 +2634,9 @@ fn collect_rule_binding_types<'a>(
     types
 }
 
-fn collect_binding_types_from_expr<'a>(
+fn collect_binding_types_from_expr<'a, V>(
     expr: &'a Expr,
-    status_by_entity: &HashMap<&str, (Vec<&Ident>, HashSet<&str>)>,
+    status_by_entity: &HashMap<&str, V>,
     out: &mut HashMap<&'a str, &'a str>,
 ) {
     match expr {
@@ -2652,7 +2680,7 @@ fn collect_command_param_types<'a, V>(
                 let params: Vec<Option<&str>> = args
                     .iter()
                     .map(|arg| match arg {
-                        CallArg::Named(named) => match &named.value {
+                        CallArg::Named(named) => match unwrap_type_refinement(&named.value) {
                             Expr::Ident(val)
                                 if status_by_entity.contains_key(val.name.as_str()) =>
                             {
@@ -3275,15 +3303,19 @@ impl Ctx<'_> {
             }
         }
 
-        // Check rule type references (when clauses, ensures entity references)
-        for rule in self.blocks(BlockKind::Rule) {
-            for item in &rule.items {
-                let BlockItemKind::Clause { keyword, value } = &item.kind else {
-                    continue;
-                };
+        // Check rule type references (when clauses, ensures entity references).
+        // Descend into `if`/`else` and `for` bodies so a type reference nested in
+        // a branch is checked, not just top-level clauses.
+        let rules: Vec<_> = self.blocks(BlockKind::Rule).collect();
+        for rule in rules {
+            let mut refs = Vec::new();
+            for_each_rule_clause(&rule.items, &mut |keyword, value| {
                 if keyword == "when" || keyword == "ensures" || keyword == "requires" {
-                    self.check_type_refs_in_rule_expr(value, &known);
+                    refs.push(value);
                 }
+            });
+            for value in refs {
+                self.check_type_refs_in_rule_expr(value, &known);
             }
         }
     }
@@ -3686,7 +3718,12 @@ fn extract_trigger_refs(expr: &Expr) -> Vec<TriggerRef<'_>> {
 
 impl Ctx<'_> {
     fn check_unused_fields(&mut self) {
-        let accessed = self.collect_all_accessed_field_names();
+        let mut accessed = self.collect_all_accessed_field_names();
+        // A field referenced only by an importer (`alias/Entity.field`) is used,
+        // even though the reference lives in another module.
+        if let Some(rev) = self.reverse_contributions {
+            accessed.extend(rev.referenced_fields.iter().map(String::as_str));
+        }
 
         for d in &self.module.declarations {
             let block = match d {
@@ -3888,6 +3925,139 @@ fn collect_idents_from_expr<'a>(expr: &'a Expr, out: &mut HashSet<&'a str>) {
             for f in fields {
                 if let Some(v) = &f.value {
                     collect_idents_from_expr(v, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collect field names an expression references through a qualified access
+/// `alias/Entity.field`. Alias-aware, unlike `collect_accessed_fields_from_expr`,
+/// so a reference through a different alias contributes nothing (contributions
+/// must stay alias-scoped for cross-module aggregation to be sound). Recurses
+/// through the same expression shapes as the module-local collector.
+fn collect_qualified_field_refs<'a>(expr: &'a Expr, alias: &str, out: &mut HashSet<&'a str>) {
+    match expr {
+        Expr::MemberAccess { object, field, .. } | Expr::OptionalAccess { object, field, .. } => {
+            if let Expr::QualifiedName(q) = object.as_ref() {
+                if q.qualifier.as_deref() == Some(alias) {
+                    out.insert(&field.name);
+                }
+            }
+            collect_qualified_field_refs(object, alias, out);
+        }
+        Expr::Call { function, args, .. } => {
+            collect_qualified_field_refs(function, alias, out);
+            for a in args {
+                match a {
+                    CallArg::Positional(e) => collect_qualified_field_refs(e, alias, out),
+                    CallArg::Named(n) => collect_qualified_field_refs(&n.value, alias, out),
+                }
+            }
+        }
+        Expr::BinaryOp { left, right, .. }
+        | Expr::Comparison { left, right, .. }
+        | Expr::LogicalOp { left, right, .. }
+        | Expr::Pipe { left, right, .. }
+        | Expr::NullCoalesce { left, right, .. }
+        | Expr::In { element: left, collection: right, .. }
+        | Expr::NotIn { element: left, collection: right, .. } => {
+            collect_qualified_field_refs(left, alias, out);
+            collect_qualified_field_refs(right, alias, out);
+        }
+        Expr::Not { operand, .. }
+        | Expr::Exists { operand, .. }
+        | Expr::NotExists { operand, .. }
+        | Expr::TypeOptional { inner: operand, .. } => {
+            collect_qualified_field_refs(operand, alias, out);
+        }
+        Expr::Where { source, condition, .. }
+        | Expr::With { source, predicate: condition, .. } => {
+            collect_qualified_field_refs(source, alias, out);
+            collect_qualified_field_refs(condition, alias, out);
+        }
+        Expr::WhenGuard { action, condition, .. } => {
+            collect_qualified_field_refs(action, alias, out);
+            collect_qualified_field_refs(condition, alias, out);
+        }
+        Expr::Binding { value, .. } | Expr::LetExpr { value, .. } | Expr::Lambda { body: value, .. } => {
+            collect_qualified_field_refs(value, alias, out);
+        }
+        Expr::TransitionsTo { subject, new_state, .. }
+        | Expr::Becomes { subject, new_state, .. } => {
+            collect_qualified_field_refs(subject, alias, out);
+            collect_qualified_field_refs(new_state, alias, out);
+        }
+        Expr::Conditional { branches, else_body, .. } => {
+            for b in branches {
+                collect_qualified_field_refs(&b.condition, alias, out);
+                collect_qualified_field_refs(&b.body, alias, out);
+            }
+            if let Some(body) = else_body {
+                collect_qualified_field_refs(body, alias, out);
+            }
+        }
+        Expr::For { collection, filter, body, .. } => {
+            collect_qualified_field_refs(collection, alias, out);
+            if let Some(f) = filter {
+                collect_qualified_field_refs(f, alias, out);
+            }
+            collect_qualified_field_refs(body, alias, out);
+        }
+        Expr::SetLiteral { elements, .. } | Expr::ListLiteral { elements, .. } => {
+            for e in elements {
+                collect_qualified_field_refs(e, alias, out);
+            }
+        }
+        Expr::ObjectLiteral { fields, .. } => {
+            for f in fields {
+                collect_qualified_field_refs(&f.value, alias, out);
+            }
+        }
+        Expr::Block { items, .. } => {
+            for item in items {
+                collect_qualified_field_refs(item, alias, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_qualified_field_refs_from_item<'a>(
+    kind: &'a BlockItemKind,
+    alias: &str,
+    out: &mut HashSet<&'a str>,
+) {
+    match kind {
+        BlockItemKind::Clause { value, .. }
+        | BlockItemKind::Assignment { value, .. }
+        | BlockItemKind::ParamAssignment { value, .. }
+        | BlockItemKind::Let { value, .. }
+        | BlockItemKind::PathAssignment { value, .. }
+        | BlockItemKind::InvariantBlock { body: value, .. }
+        | BlockItemKind::FieldWithWhen { value, .. } => {
+            collect_qualified_field_refs(value, alias, out);
+        }
+        BlockItemKind::ForBlock { collection, filter, items, .. } => {
+            collect_qualified_field_refs(collection, alias, out);
+            if let Some(f) = filter {
+                collect_qualified_field_refs(f, alias, out);
+            }
+            for item in items {
+                collect_qualified_field_refs_from_item(&item.kind, alias, out);
+            }
+        }
+        BlockItemKind::IfBlock { branches, else_items } => {
+            for b in branches {
+                collect_qualified_field_refs(&b.condition, alias, out);
+                for item in &b.items {
+                    collect_qualified_field_refs_from_item(&item.kind, alias, out);
+                }
+            }
+            if let Some(items) = else_items {
+                for item in items {
+                    collect_qualified_field_refs_from_item(&item.kind, alias, out);
                 }
             }
         }
@@ -4350,6 +4520,15 @@ fn collect_uppercase_idents_from_expr<'a>(expr: &'a Expr, out: &mut Vec<Referenc
 /// cross-module reference map so that shared declarations are not flagged as
 /// unused.
 pub fn collect_qualified_references(module: &Module) -> Vec<(String, String)> {
+    collect_qref_nodes(module)
+        .into_iter()
+        .map(|r| (r.qualifier.to_string(), r.name.to_string()))
+        .collect()
+}
+
+/// Every qualified reference in a module, with spans. Backs both the
+/// cross-module reference map and the undefined-import-alias check.
+fn collect_qref_nodes(module: &Module) -> Vec<QRef<'_>> {
     let mut refs = Vec::new();
     for d in &module.declarations {
         match d {
@@ -4530,13 +4709,15 @@ pub fn collect_trigger_outputs(module: &Module) -> HashSet<String> {
     names.into_iter().map(str::to_string).collect()
 }
 
-/// Collect every trigger name a module references: those it provides or emits
-/// (`collect_trigger_outputs`) plus those its rules listen for in `when:`
-/// clauses. Used by multi-file checking to validate a qualified `provides:`
-/// entry against the aliased module — a trigger the module never mentions is a
-/// resolution error at the entry (#72).
+/// Collect every name a module *offers* to importers: declared type names
+/// (`collect_declared_names`), plus every trigger name it references — provided,
+/// emitted (`collect_trigger_outputs`), or listened for in `when:` clauses.
+/// Used by multi-file checking to validate a qualified reference `alias/Name`
+/// against the aliased module — a name it never mentions is a resolution error
+/// at the reference (#72, and the name-existence audit).
 pub fn collect_referenced_trigger_names(module: &Module) -> HashSet<String> {
     let mut names = collect_trigger_outputs(module);
+    names.extend(collect_declared_names(module));
     for d in &module.declarations {
         let Decl::Block(b) = d else { continue };
         if b.kind != BlockKind::Rule {
@@ -4570,12 +4751,14 @@ pub fn collect_reverse_contributions<'a>(
     let imported_info = EntityInfo::from_module(imported);
     let status_by_entity = imported_info.status_by_entity();
 
-    // Command → positional parameter entity types. Two sources contribute a
+    // Command → positional parameter entity types. Three sources contribute a
     // parameter typed to a status-bearing imported entity:
     //   - the imported module's surface `provides:` (`Trigger(b: Entity)`),
-    //     typing a binding the importer subscribes to across the boundary; and
+    //     typing a binding the importer subscribes to across the boundary;
     //   - the importer's OWN surface `provides:`, where a parameter is typed to
-    //     a qualified imported entity inline or via a `context` binding (#65).
+    //     a qualified imported entity inline or via a `context` binding (#65); and
+    //   - the imported module's rule emissions (`ensures: Event(p: b)`), where
+    //     the emitting rule's own trigger types `b` (#77).
     let mut command_param_types: HashMap<&str, Vec<Option<&str>>> = HashMap::new();
     for b in module_blocks(imported, BlockKind::Surface) {
         for item in &b.items {
@@ -4589,6 +4772,7 @@ pub fn collect_reverse_contributions<'a>(
     collect_importer_command_param_types(
         importer, alias, &status_by_entity, &mut command_param_types,
     );
+    collect_emitted_event_param_types(imported, &status_by_entity, &mut command_param_types);
 
     // 1. Provided triggers: `provides: alias/Trigger(...)` in importer surfaces.
     for b in module_blocks(importer, BlockKind::Surface) {
@@ -4602,19 +4786,49 @@ pub fn collect_reverse_contributions<'a>(
     }
 
     // 2 & 3. Qualified creation and witnessed transitions from importer rules.
+    // Descend into `if`/`else` and `for` bodies so a creation nested in a branch
+    // is seen, not just top-level ensures (the #58 traversal fix).
     for rule in module_blocks(importer, BlockKind::Rule) {
-        for item in &rule.items {
-            if let BlockItemKind::Clause { keyword, value } = &item.kind {
-                if keyword == "ensures" {
-                    collect_qualified_created(
-                        value, alias, &status_by_entity, &mut out.assigned_statuses,
-                    );
-                }
+        for_each_rule_clause(&rule.items, &mut |keyword, value| {
+            if keyword == "ensures" {
+                collect_qualified_created(value, alias, &status_by_entity, &mut out.assigned_statuses);
             }
-        }
+        });
         collect_witnessed_transition(
             rule, alias, &command_param_types, &status_by_entity, &mut out,
         );
+    }
+
+    // Fields the importer references through this alias (`alias/Entity.field`),
+    // restricted to real imported-entity fields. Credited so the imported module
+    // does not report a field as unused when its only reference lives across the
+    // boundary.
+    let mut imported_field_names: HashSet<&str> = HashSet::new();
+    for entity in module_blocks(imported, BlockKind::Entity)
+        .chain(module_blocks(imported, BlockKind::ExternalEntity))
+    {
+        for item in &entity.items {
+            if let BlockItemKind::Assignment { name, .. }
+            | BlockItemKind::FieldWithWhen { name, .. } = &item.kind
+            {
+                imported_field_names.insert(&name.name);
+            }
+        }
+    }
+    if !imported_field_names.is_empty() {
+        let mut qualified_refs: HashSet<&str> = HashSet::new();
+        for block in &importer.declarations {
+            if let Decl::Block(b) = block {
+                for item in &b.items {
+                    collect_qualified_field_refs_from_item(&item.kind, alias, &mut qualified_refs);
+                }
+            }
+        }
+        for f in qualified_refs {
+            if imported_field_names.contains(f) {
+                out.referenced_fields.insert(f.to_string());
+            }
+        }
     }
 
     out
@@ -4663,38 +4877,6 @@ fn collect_qualified_provides(expr: &Expr, alias: &str, out: &mut HashSet<String
     }
 }
 
-/// Collect every qualified provides entry `qualifier/Name` with the span to
-/// anchor a diagnostic at, for resolution checking (#72).
-fn collect_qualified_provides_refs<'a>(
-    expr: &'a Expr,
-    out: &mut Vec<(&'a str, &'a str, Span)>,
-) {
-    match expr {
-        Expr::Call { function, .. } => {
-            if let Expr::QualifiedName(q) = function.as_ref() {
-                if let Some(qualifier) = q.qualifier.as_deref() {
-                    out.push((qualifier, q.name.as_str(), q.span));
-                }
-            }
-        }
-        Expr::Block { items, .. } => {
-            for item in items {
-                collect_qualified_provides_refs(item, out);
-            }
-        }
-        Expr::WhenGuard { action, .. } => collect_qualified_provides_refs(action, out),
-        Expr::Conditional { branches, else_body, .. } => {
-            for b in branches {
-                collect_qualified_provides_refs(&b.body, out);
-            }
-            if let Some(body) = else_body {
-                collect_qualified_provides_refs(body, out);
-            }
-        }
-        Expr::For { body, .. } => collect_qualified_provides_refs(body, out),
-        _ => {}
-    }
-}
 
 /// Augment `out` with the importer's own surface `provides:` parameter types,
 /// where a parameter is typed to a status-bearing imported entity — inline
@@ -4729,8 +4911,109 @@ fn collect_importer_command_param_types<'a>(
     }
 }
 
+/// Add rule-emitted events as a binding-type source (#77). For an imported rule
+/// `ensures: Event(param: b)`, the event's parameter takes the type the emitting
+/// rule's own trigger gives `b`, mapped positionally so a positional subscriber
+/// binding resolves. This lets a consumer subscribing to a rule-emitted event
+/// across a module boundary type its binding.
+fn collect_emitted_event_param_types<'a>(
+    imported: &'a Module,
+    status_by_entity: &HashMap<&'a str, HashSet<&'a str>>,
+    out: &mut HashMap<&'a str, Vec<Option<&'a str>>>,
+) {
+    // The emitting rule's binding may be typed by the imported module's own
+    // surface `provides:` parameters, not only by a transition trigger — so type
+    // it the same way the local pass does, from those parameters (else the
+    // emission carries no type across the split).
+    let mut surface_params: HashMap<&str, Vec<Option<&str>>> = HashMap::new();
+    for surface in module_blocks(imported, BlockKind::Surface) {
+        for item in &surface.items {
+            if let BlockItemKind::Clause { keyword, value } = &item.kind {
+                if keyword == "provides" {
+                    collect_command_param_types(value, status_by_entity, &mut surface_params);
+                }
+            }
+        }
+    }
+    for rule in module_blocks(imported, BlockKind::Rule) {
+        let mut binding_types = collect_rule_binding_types(rule, status_by_entity);
+        augment_binding_types_from_commands(rule, &surface_params, &mut binding_types);
+        if binding_types.is_empty() {
+            continue;
+        }
+        for_each_rule_clause(&rule.items, &mut |keyword, value| {
+            if keyword == "ensures" {
+                collect_emission_param_types(value, &binding_types, out);
+            }
+        });
+    }
+}
+
+/// From an `ensures:` value, record each leading `Event(args)` emission's
+/// positional parameter types, resolved from the emitting rule's binding types.
+fn collect_emission_param_types<'a>(
+    expr: &'a Expr,
+    binding_types: &HashMap<&'a str, &'a str>,
+    out: &mut HashMap<&'a str, Vec<Option<&'a str>>>,
+) {
+    match expr {
+        Expr::Call { function, args, .. } => {
+            if let Expr::Ident(event) = function.as_ref() {
+                let params: Vec<Option<&str>> = args
+                    .iter()
+                    .map(|arg| {
+                        let val = match arg {
+                            CallArg::Named(n) => &n.value,
+                            CallArg::Positional(e) => e,
+                        };
+                        match val {
+                            Expr::Ident(v) => binding_types.get(v.name.as_str()).copied(),
+                            _ => None,
+                        }
+                    })
+                    .collect();
+                if params.iter().any(Option::is_some) {
+                    out.entry(&event.name).or_insert(params);
+                }
+            }
+        }
+        Expr::Block { items, .. } => {
+            for item in items {
+                collect_emission_param_types(item, binding_types, out);
+            }
+        }
+        Expr::Conditional { branches, else_body, .. } => {
+            for b in branches {
+                collect_emission_param_types(&b.body, binding_types, out);
+            }
+            if let Some(body) = else_body {
+                collect_emission_param_types(body, binding_types, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Record a surface `context`/`facing` binding typed to a qualified imported
 /// entity: `name: alias/Entity` maps `name` to the imported entity.
+/// Peel transparent type-refinement wrappers so a resolver sees the underlying
+/// type expression. A binding's declared type may be refined with `where`
+/// (`Expr::Where`) or `with` (`Expr::With`), or marked optional (`Expr::TypeOptional`);
+/// none of these change which entity the binding refers to. Any resolver that
+/// matches `QualifiedName`/`Ident` to type a binding must unwrap first, or a
+/// refined type silently fails to resolve (the #76 family). One helper so the
+/// unwrap can't be applied at one site and forgotten at its siblings.
+fn unwrap_type_refinement(expr: &Expr) -> &Expr {
+    let mut cur = expr;
+    loop {
+        cur = match cur {
+            Expr::Where { source, .. } | Expr::With { source, .. } => source,
+            Expr::TypeOptional { inner, .. } => inner,
+            other => return other,
+        };
+    }
+}
+
 fn qualified_context_binding<'a>(
     expr: &'a Expr,
     alias: &str,
@@ -4739,7 +5022,10 @@ fn qualified_context_binding<'a>(
 ) {
     match expr {
         Expr::Binding { name, value, .. } => {
-            if let Expr::QualifiedName(q) = value.as_ref() {
+            // `context b: alias/E where …` (and `with …`, and `alias/E?`) must
+            // type `b` exactly as the bare `context b: alias/E` does (#76 family).
+            let type_expr = unwrap_type_refinement(value.as_ref());
+            if let Expr::QualifiedName(q) = type_expr {
                 if q.qualifier.as_deref() == Some(alias) {
                     if let Some((entity, _)) = status_by_entity.get_key_value(q.name.as_str()) {
                         out.insert(&name.name, entity);
@@ -4774,7 +5060,7 @@ fn collect_provides_param_types<'a>(
                         CallArg::Positional(Expr::Ident(id)) => {
                             context_types.get(id.name.as_str()).copied()
                         }
-                        CallArg::Named(n) => match &n.value {
+                        CallArg::Named(n) => match unwrap_type_refinement(&n.value) {
                             Expr::QualifiedName(q) if q.qualifier.as_deref() == Some(alias) => {
                                 status_by_entity.get_key_value(q.name.as_str()).map(|(k, _)| *k)
                             }
@@ -4924,6 +5210,12 @@ fn collect_witnessed_transition(
                 {
                     binding_entity.insert(name.name.as_str(), entity);
                     trigger_source.insert(name.name.as_str(), source);
+                } else if let Some(entity) =
+                    qualified_temporal_trigger_entity(inner, alias, status_by_entity)
+                {
+                    // Temporal/relational trigger: type the binding, but let the
+                    // `requires` clause supply the `from` (no implicit source).
+                    binding_entity.insert(name.name.as_str(), entity);
                 }
             }
             _ => {}
@@ -4940,19 +5232,19 @@ fn collect_witnessed_transition(
     for (binding, source) in &trigger_source {
         froms.entry(binding).or_default().insert(source);
     }
-    for item in &rule.items {
-        let BlockItemKind::Clause { keyword, value } = &item.kind else {
-            continue;
-        };
-        let target = match keyword.as_str() {
+    // Descend into `if`/`else` and `for` bodies so a guard or assignment nested
+    // in a branch is seen, not just top-level clauses (the #58 traversal fix,
+    // applied here in the reverse channel).
+    for_each_rule_clause(&rule.items, &mut |keyword, value| {
+        let target = match keyword {
             "requires" => &mut froms,
             "ensures" => &mut tos,
-            _ => continue,
+            _ => return,
         };
         collect_binding_status_eq(value, &mut |binding, status| {
             target.entry(binding).or_default().insert(status);
         });
-    }
+    });
 
     for (binding, entity) in &binding_entity {
         let Some(valid) = status_by_entity.get(*entity) else {
@@ -5016,6 +5308,41 @@ fn qualified_transition_trigger<'a>(
         return None;
     }
     Some((*entity, source))
+}
+
+/// Resolve the imported entity that a temporal or relational trigger observes,
+/// e.g. `m: alias/E.expires_at <= now`. Unlike `becomes`/`transitions_to`, such a
+/// trigger carries no implicit `from` state, so the binding is typed but no source
+/// status is contributed; the rule's `requires` clause supplies the `from`. Without
+/// this, a temporal-triggered transition over an imported entity is never credited
+/// back across the split, so the imported entity looks stuck (false `deadlock`,
+/// `noExit`, `unreachableValue`).
+fn qualified_temporal_trigger_entity<'a>(
+    expr: &'a Expr,
+    alias: &str,
+    status_by_entity: &HashMap<&'a str, HashSet<&'a str>>,
+) -> Option<&'a str> {
+    fn member_entity<'a>(
+        e: &'a Expr,
+        alias: &str,
+        status_by_entity: &HashMap<&'a str, HashSet<&'a str>>,
+    ) -> Option<&'a str> {
+        let Expr::MemberAccess { object, .. } = e else {
+            return None;
+        };
+        let Expr::QualifiedName(q) = object.as_ref() else {
+            return None;
+        };
+        if q.qualifier.as_deref() != Some(alias) {
+            return None;
+        }
+        status_by_entity.get_key_value(q.name.as_str()).map(|(k, _)| *k)
+    }
+    match expr {
+        Expr::Comparison { left, right, .. } => member_entity(left, alias, status_by_entity)
+            .or_else(|| member_entity(right, alias, status_by_entity)),
+        _ => None,
+    }
 }
 
 /// From a local `when: b: Entity.status becomes state` (or `transitions_to`)
@@ -5089,7 +5416,32 @@ pub fn collect_entity_field_schemas(module: &Module) -> HashMap<String, HashSet<
     out
 }
 
-fn collect_qrefs_from_item(kind: &BlockItemKind, out: &mut Vec<(String, String)>) {
+/// Entity name → its declared status values. The cross-module counterpart of
+/// [`collect_entity_field_schemas`]: it gives an importer's conflict pass the
+/// status vocabulary of the entities it imports, so two importer rules acting on
+/// an imported entity can be attributed to it and compared for conflict.
+pub fn collect_entity_status_schemas(module: &Module) -> HashMap<String, HashSet<String>> {
+    EntityInfo::from_module(module)
+        .status_by_entity()
+        .into_iter()
+        .map(|(name, statuses)| {
+            (
+                name.to_string(),
+                statuses.into_iter().map(|s| s.to_string()).collect(),
+            )
+        })
+        .collect()
+}
+
+/// A qualified reference `qualifier/name` (or the `alias.Type` dot form) with
+/// the span to anchor a diagnostic at.
+struct QRef<'a> {
+    qualifier: &'a str,
+    name: &'a str,
+    span: Span,
+}
+
+fn collect_qrefs_from_item<'a>(kind: &'a BlockItemKind, out: &mut Vec<QRef<'a>>) {
     match kind {
         BlockItemKind::Clause { value, .. }
         | BlockItemKind::Assignment { value, .. }
@@ -5132,8 +5484,8 @@ fn collect_qrefs_from_item(kind: &BlockItemKind, out: &mut Vec<(String, String)>
         }
         BlockItemKind::ContractsClause { entries } => {
             for e in entries {
-                if let Some(ref qualifier) = e.qualifier {
-                    out.push((qualifier.clone(), e.name.name.clone()));
+                if let Some(qualifier) = &e.qualifier {
+                    out.push(QRef { qualifier, name: &e.name.name, span: e.name.span });
                 }
             }
         }
@@ -5143,11 +5495,11 @@ fn collect_qrefs_from_item(kind: &BlockItemKind, out: &mut Vec<(String, String)>
     }
 }
 
-fn collect_qrefs_from_expr(expr: &Expr, out: &mut Vec<(String, String)>) {
+fn collect_qrefs_from_expr<'a>(expr: &'a Expr, out: &mut Vec<QRef<'a>>) {
     match expr {
         Expr::QualifiedName(q) => {
-            if let Some(ref qualifier) = q.qualifier {
-                out.push((qualifier.clone(), q.name.clone()));
+            if let Some(qualifier) = &q.qualifier {
+                out.push(QRef { qualifier, name: &q.name, span: q.span });
             }
         }
         Expr::MemberAccess { object, field, .. }
@@ -5155,7 +5507,7 @@ fn collect_qrefs_from_expr(expr: &Expr, out: &mut Vec<(String, String)>) {
             // Detect alias.TypeName pattern (e.g. core.EntityMap in exposes)
             if let Expr::Ident(id) = object.as_ref() {
                 if starts_uppercase(&field.name) {
-                    out.push((id.name.clone(), field.name.clone()));
+                    out.push(QRef { qualifier: &id.name, name: &field.name, span: id.span.merge(field.span) });
                 }
             }
             collect_qrefs_from_expr(object, out);
@@ -5498,14 +5850,16 @@ impl Ctx<'_> {
 }
 
 impl Ctx<'_> {
-    /// A qualified type name in a `default` (`default alias/Type x = ...`) must
-    /// reference a module brought into scope by `use "..." as alias`. Keeps
-    /// parity with the TypeScript `findDefaultTypeReferenceIssues` alias check.
-    /// Validate qualified `provides: alias/Trigger` entries at the entry (#72).
-    /// An `alias` that matches no `use` import is an error; a trigger name the
-    /// aliased module never references is a warning, but only when that module
-    /// is in the check set (a target outside it is unknowable by design).
-    fn check_qualified_provides(&mut self) {
+
+    /// A qualified reference `alias/Name` at any site — a `when:` trigger or
+    /// entity subject, a `provides:` entry, a surface `context`, an inline
+    /// parameter type, a field type, a `.created(...)` call, a `default`, a
+    /// contract clause — must name a module brought into scope by `use "..." as
+    /// alias`. A qualifier matching no declared alias is a locally-knowable typo
+    /// and is diagnosed at the reference, single-file and multi-file alike
+    /// (#78 and the wider sites audit). One pass over every qualified reference
+    /// rather than a separate check per site.
+    fn check_undefined_import_aliases(&mut self) {
         let aliases: HashSet<&str> = self
             .module
             .declarations
@@ -5516,72 +5870,52 @@ impl Ctx<'_> {
             })
             .collect();
 
-        let mut entries: Vec<(&str, &str, Span)> = Vec::new();
-        for surface in self.blocks(BlockKind::Surface) {
-            for item in &surface.items {
-                if let BlockItemKind::Clause { keyword, value } = &item.kind {
-                    if keyword == "provides" {
-                        collect_qualified_provides_refs(value, &mut entries);
-                    }
+        let mut refs = collect_qref_nodes(self.module);
+        // A `default alias/Type` reference's qualifier sits on the declaration,
+        // not inside its value expression, so add it explicitly.
+        for d in &self.module.declarations {
+            if let Decl::Default(def) = d {
+                if let (Some(a), Some(t)) = (&def.type_alias, &def.type_name) {
+                    refs.push(QRef {
+                        qualifier: &a.name,
+                        name: &t.name,
+                        span: a.span.merge(t.span),
+                    });
                 }
             }
         }
 
-        for (qualifier, name, span) in entries {
-            if !aliases.contains(qualifier) {
+        for r in refs {
+            if !aliases.contains(r.qualifier) {
                 self.push(
                     Diagnostic::error(
-                        span,
+                        r.span,
                         format!(
-                            "Provides entry '{qualifier}/{name}' uses unknown import alias '{qualifier}'."
+                            "Reference '{}/{}' uses unknown import alias '{}'.",
+                            r.qualifier, r.name, r.qualifier
                         ),
                     )
-                    .with_code("allium.provides.undefinedImportedAlias"),
+                    .with_code("allium.reference.undefinedImportedAlias"),
                 );
-            } else if let Some(triggers) = self
+            } else if let Some(offered) = self
                 .imported_referenced_triggers
-                .and_then(|m| m.get(qualifier))
+                .and_then(|m| m.get(r.qualifier))
             {
-                if !triggers.contains(name) {
+                // The alias resolves into the check set: the name must be one the
+                // aliased module offers (a declared type or a referenced trigger).
+                // A target outside the check set is unknowable and left alone.
+                if !offered.contains(r.name) {
                     self.push(
                         Diagnostic::warning(
-                            span,
+                            r.span,
                             format!(
-                                "Provides entry '{qualifier}/{name}' names trigger '{name}', which imported module '{qualifier}' does not use."
+                                "Reference '{}/{}' names '{}', which imported module '{}' does not define.",
+                                r.qualifier, r.name, r.name, r.qualifier
                             ),
                         )
-                        .with_code("allium.provides.unknownTrigger"),
+                        .with_code("allium.reference.unknownName"),
                     );
                 }
-            }
-        }
-    }
-
-    fn check_qualified_default_aliases(&mut self) {
-        let mut aliases: HashSet<&str> = HashSet::new();
-        for d in &self.module.declarations {
-            if let Decl::Use(u) = d {
-                if let Some(alias) = &u.alias {
-                    aliases.insert(alias.name.as_str());
-                }
-            }
-        }
-        for d in &self.module.declarations {
-            let Decl::Default(def) = d else { continue };
-            let (Some(alias), Some(type_name)) = (&def.type_alias, &def.type_name) else {
-                continue;
-            };
-            if !aliases.contains(alias.name.as_str()) {
-                self.push(
-                    Diagnostic::error(
-                        alias.span.merge(type_name.span),
-                        format!(
-                            "Type reference '{}/{}' uses unknown import alias '{}'.",
-                            alias.name, type_name.name, alias.name
-                        ),
-                    )
-                    .with_code("allium.default.undefinedImportedAlias"),
-                );
             }
         }
     }
@@ -5967,52 +6301,13 @@ impl Ctx<'_> {
                 collect_bound_names(value, &mut bound);
             }
 
-            // Collect let bindings
-            for item in &rule.items {
-                if let BlockItemKind::Let { name, .. } = &item.kind {
-                    bound.insert(&name.name);
-                }
-            }
-
-            // Check requires/ensures for unbound references
-            for item in &rule.items {
-                let BlockItemKind::Clause { keyword, value } = &item.kind else {
-                    continue;
-                };
-                if keyword != "requires" && keyword != "ensures" {
-                    continue;
-                }
-                check_unbound_roots(value, &bound, rule_name, &mut self.diagnostics);
-            }
-
-            // Check for-block and if-block items
-            for item in &rule.items {
-                match &item.kind {
-                    BlockItemKind::ForBlock {
-                        binding,
-                        items,
-                        ..
-                    } => {
-                        let mut inner_bound = bound.clone();
-                        match binding {
-                            ForBinding::Single(id) => { inner_bound.insert(&id.name); }
-                            ForBinding::Destructured(ids, _) => {
-                                for id in ids {
-                                    inner_bound.insert(&id.name);
-                                }
-                            }
-                        }
-                        for sub_item in items {
-                            if let BlockItemKind::Clause { keyword, value } = &sub_item.kind {
-                                if keyword == "ensures" || keyword == "requires" {
-                                    check_unbound_roots(value, &inner_bound, rule_name, &mut self.diagnostics);
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            // Check requires/ensures for unbound references, descending into
+            // `if`/`else` and `for` bodies. Let-bindings are collected per block
+            // level (so a branch-local let scopes only within that branch and a
+            // sibling branch can't see it), and each `for` body adds its loop
+            // binding. Previously only top-level and one level of `for` were
+            // checked, so a branch-nested unbound reference went unflagged.
+            check_unbound_in_items(&rule.items, &bound, rule_name, &mut self.diagnostics);
 
             // Rules with bare entity bindings (e.g. `when: state: ClerkEventState`)
             // have an invalid trigger form. The binding name is syntactically present
@@ -6024,7 +6319,14 @@ impl Ctx<'_> {
                 if !matches!(trigger_value.as_ref(), Expr::Ident(id) if starts_uppercase(&id.name)) {
                     continue;
                 }
-                // Find the first requires/ensures clause that references this binding
+                // Find the first requires/ensures clause that references this binding.
+                // NOTE: this only scans top-level clauses, so if the binding is
+                // referenced *only* inside an `if`/`for` branch the secondary
+                // `undefinedBinding` anchor is not emitted. This is benign today
+                // because the malformed trigger still raises `invalidTrigger`
+                // regardless, so the rule is never silently accepted. Making it
+                // branch-aware needs a span-carrying traversal (the diagnostic
+                // anchors on `check_item.span`, which `for_each_rule_clause` drops).
                 let mut found = false;
                 for check_item in &rule.items {
                     let BlockItemKind::Clause { keyword: kw, value: v } = &check_item.kind else { continue };
@@ -6046,6 +6348,57 @@ impl Ctx<'_> {
                 }
                 if found { break; }
             }
+        }
+    }
+}
+
+/// Check `requires`/`ensures` clauses for references to unbound names, recursing
+/// through `if`/`else` and `for` bodies. Each block level first collects its own
+/// `let` names (so references resolve regardless of order and a branch-local let
+/// is invisible to sibling branches and the parent), and each `for` body adds its
+/// loop binding to the in-scope set.
+fn check_unbound_in_items<'a>(
+    items: &'a [BlockItem],
+    parent_bound: &HashSet<&'a str>,
+    rule_name: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let mut bound: HashSet<&'a str> = parent_bound.clone();
+    for item in items {
+        if let BlockItemKind::Let { name, .. } = &item.kind {
+            bound.insert(&name.name);
+        }
+    }
+    for item in items {
+        match &item.kind {
+            BlockItemKind::Clause { keyword, value } => {
+                if keyword == "requires" || keyword == "ensures" {
+                    check_unbound_roots(value, &bound, rule_name, diagnostics);
+                }
+            }
+            BlockItemKind::IfBlock { branches, else_items } => {
+                for b in branches {
+                    check_unbound_in_items(&b.items, &bound, rule_name, diagnostics);
+                }
+                if let Some(else_items) = else_items {
+                    check_unbound_in_items(else_items, &bound, rule_name, diagnostics);
+                }
+            }
+            BlockItemKind::ForBlock { binding, items: for_items, .. } => {
+                let mut inner = bound.clone();
+                match binding {
+                    ForBinding::Single(id) => {
+                        inner.insert(&id.name);
+                    }
+                    ForBinding::Destructured(ids, _) => {
+                        for id in ids {
+                            inner.insert(&id.name);
+                        }
+                    }
+                }
+                check_unbound_in_items(for_items, &inner, rule_name, diagnostics);
+            }
+            _ => {}
         }
     }
 }
@@ -6987,6 +7340,26 @@ mod tests {
              requires: m.status = active\n  ensures: m.status = expired\n}\n\n\
              rule ManualExtend {\n  when: AdminExtends(admin, membership)\n  \
              requires: membership.status = active\n  ensures: membership.status = extended\n}\n",
+        );
+        assert!(has_finding(&r, "conflict"));
+    }
+
+    #[test]
+    fn conflict_detected_when_effect_nested_in_branch() {
+        // The conflicting `ensures` sits inside an `if`/`else`, so a
+        // top-level-only walk of the rule body would miss it. The conflict must
+        // still be found (branch-nesting invariance for conflict detection).
+        let r = analyse_src(
+            "entity Membership {\n  status: active | expired | extended\n  \
+             expires_at: Timestamp\n  \
+             transitions status {\n    active -> expired\n    active -> extended\n    \
+             terminal: expired, extended\n  }\n}\n\n\
+             rule AutoExpire {\n  when: m: Membership.expires_at <= now\n  \
+             requires: m.status = active\n  ensures: m.status = expired\n}\n\n\
+             rule ManualExtend {\n  when: AdminExtends(admin, membership, flag)\n  \
+             requires: membership.status = active\n  \
+             if flag:\n    ensures: membership.status = extended\n  \
+             else:\n    ensures: membership.status = extended\n}\n",
         );
         assert!(has_finding(&r, "conflict"));
     }
@@ -8030,14 +8403,14 @@ surface AccountManagement {
         let ds = analyze_src(
             "use \"./p.allium\" as gp\n\ndefault gp/Policy my_policy = { id: \"x\" }",
         );
-        assert!(!has_code(&ds, "allium.default.undefinedImportedAlias"));
+        assert!(!has_code(&ds, "allium.reference.undefinedImportedAlias"));
     }
 
     #[test]
     fn qualified_default_unknown_alias_flagged() {
-        // `zz` is not imported — must be flagged, matching the TS analyzer.
+        // `zz` is not imported — must be flagged by the unified reference check.
         let ds = analyze_src("default zz/Policy my_policy = { id: \"x\" }");
-        assert!(has_code(&ds, "allium.default.undefinedImportedAlias"));
+        assert!(has_code(&ds, "allium.reference.undefinedImportedAlias"));
     }
 
     // -- Default field-schema validation (drift) + rule 14c --
@@ -8216,6 +8589,21 @@ surface AccountManagement {
         // Asked for a different alias — nothing should be credited.
         let rc = collect_reverse_contributions(&importer, "other", &imported);
         assert!(rc.is_empty());
+    }
+
+    #[test]
+    fn reverse_contributions_credit_qualified_field_reference() {
+        let imported =
+            module_of("entity Ticket {\n  status: open | closed\n  due_at: Timestamp\n}\n");
+        let importer = module_of(
+            "use \"./t.allium\" as tickets\nrule Sweep {\n  when: t: tickets/Ticket.due_at <= now\n  requires: t.status = open\n  ensures: t.status = closed\n}\n",
+        );
+        // `due_at` is referenced only across the boundary, so it must be credited
+        // for the matching alias and left alone for a different one.
+        let rc = collect_reverse_contributions(&importer, "tickets", &imported);
+        assert!(rc.referenced_fields.contains("due_at"));
+        let other = collect_reverse_contributions(&importer, "other", &imported);
+        assert!(!other.referenced_fields.contains("due_at"));
     }
 
     #[test]
